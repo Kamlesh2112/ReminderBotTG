@@ -1,0 +1,24 @@
+# Environment variables
+.env
+
+# SQLite Database & Data
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+
+# Virtual Environment
+venv/
+.venv/
+env/
+
+# Process lock
+.bot.pid
+
