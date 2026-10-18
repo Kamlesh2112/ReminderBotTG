@@ -603,3 +603,30 @@ def format_ist_datetime(dt: datetime) -> str:
     """Formats datetime as 'Tuesday, 20 Oct 2026 at 04:30 PM IST'"""
     dt_ist = dt.astimezone(IST)
     return dt_ist.strftime("%A, %d %b %Y at %I:%M %p IST")
+
+
+def format_minimal_set_time(trigger_time: datetime, now: datetime | None = None) -> str:
+    """Formats minimal readable time for confirmation: e.g. 'Tuesday, 20 Oct at 4:30 PM'"""
+    if now is None:
+        now = datetime.now(IST)
+    else:
+        now = now.astimezone(IST)
+
+    dt_ist = trigger_time.astimezone(IST)
+    time_str = dt_ist.strftime("%I:%M %p").lstrip("0")
+    diff_days = (dt_ist.date() - now.date()).days
+
+    if diff_days == 0:
+        total_seconds = int((dt_ist - now).total_seconds())
+        if total_seconds < 3600:
+            delta_str = format_relative_delta(dt_ist, now)
+            return f"today at {time_str} ({delta_str})"
+        return f"today at {time_str}"
+    elif diff_days == 1:
+        return f"tomorrow at {time_str}"
+    else:
+        day_str = dt_ist.strftime("%A, %d %b").replace(" 0", " ")
+        if dt_ist.year != now.year:
+            day_str += f" {dt_ist.year}"
+        return f"{day_str} at {time_str}"
+

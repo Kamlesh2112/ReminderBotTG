@@ -137,39 +137,17 @@ async def handle_dell(update: Update, specific_id: int | None = None) -> None:
     if specific_id is not None:
         deleted = database.delete_reminder_by_id(specific_id, chat_id)
         if deleted:
-            dt = datetime.fromisoformat(deleted["trigger_time_iso"])
-            time_str = parser.format_ist_datetime(dt)
-            escaped_text = html.escape(deleted["original_text"])
-            await update.effective_message.reply_text(
-                f"🗑️ <b>Deleted reminder #{specific_id}:</b>\n\n"
-                f"<code>{escaped_text}</code>\n\n"
-                f"⏰ <i>Was scheduled for: {time_str}</i>",
-                parse_mode=ParseMode.HTML
-            )
+            await update.effective_message.reply_text(f"🗑️ Deleted #{specific_id}: {deleted['original_text']}")
         else:
-            await update.effective_message.reply_text(
-                f"⚠️ Reminder #{specific_id} not found or already sent/deleted.",
-                parse_mode=ParseMode.HTML
-            )
+            await update.effective_message.reply_text(f"⚠️ Reminder #{specific_id} not found.")
         return
 
     # Delete the last reminder
     deleted = database.delete_last_pending_reminder(chat_id)
     if deleted:
-        dt = datetime.fromisoformat(deleted["trigger_time_iso"])
-        time_str = parser.format_ist_datetime(dt)
-        escaped_text = html.escape(deleted["original_text"])
-        await update.effective_message.reply_text(
-            f"🗑️ <b>Deleted last reminder:</b>\n\n"
-            f"<code>{escaped_text}</code>\n\n"
-            f"⏰ <i>Was scheduled for: {time_str}</i>",
-            parse_mode=ParseMode.HTML
-        )
+        await update.effective_message.reply_text(f"🗑️ Deleted: {deleted['original_text']}")
     else:
-        await update.effective_message.reply_text(
-            "ℹ️ <b>No active reminders found to delete.</b>",
-            parse_mode=ParseMode.HTML
-        )
+        await update.effective_message.reply_text("ℹ️ No active reminders.")
 
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -216,20 +194,10 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             message_id=message_id
         )
 
-        time_str = parser.format_ist_datetime(trigger_dt)
-        countdown = parser.format_relative_delta(trigger_dt, now_ist)
-        escaped_text = html.escape(raw_text)
-
-        confirm_msg = (
-            f"✅ <b>Followup Scheduled!</b>\n\n"
-            f"<code>{escaped_text}</code>\n\n"
-            f"⏰ <b>When:</b> {time_str}\n"
-            f"⏳ <b>Countdown:</b> {countdown}\n\n"
-            f"<i>Tap the text above to copy. Send <code>dell</code> to cancel.</i>"
-        )
+        time_str = parser.format_minimal_set_time(trigger_dt, now_ist)
+        confirm_msg = f"✅ Set for {time_str}"
         await update.effective_message.reply_text(
             confirm_msg,
-            parse_mode=ParseMode.HTML,
             reply_to_message_id=message_id
         )
         return
@@ -281,8 +249,8 @@ async def run_reminder_scheduler(application: Application) -> None:
                 orig_text = reminder["original_text"]
                 msg_id = reminder.get("message_id")
 
-                # Exact format requested: one bell symbol and copyable text
-                notification_text = f"🔔 <code>{html.escape(orig_text)}</code>"
+                # Readable normal text with one bell symbol (not copyable monospace block)
+                notification_text = f"🔔 {orig_text}"
 
                 sent_ok = False
                 # Try sending as a reply to the original message first
@@ -291,7 +259,6 @@ async def run_reminder_scheduler(application: Application) -> None:
                         await application.bot.send_message(
                             chat_id=chat_id,
                             text=notification_text,
-                            parse_mode=ParseMode.HTML,
                             reply_to_message_id=msg_id
                         )
                         sent_ok = True
@@ -303,8 +270,7 @@ async def run_reminder_scheduler(application: Application) -> None:
                     try:
                         await application.bot.send_message(
                             chat_id=chat_id,
-                            text=notification_text,
-                            parse_mode=ParseMode.HTML
+                            text=notification_text
                         )
                         sent_ok = True
                     except TelegramError as e:
