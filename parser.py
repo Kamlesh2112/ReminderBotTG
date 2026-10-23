@@ -335,7 +335,7 @@ def parse_date_component(tokens: list[str]) -> tuple[int, int, int | None, list[
         if idx < len(tokens) and tokens[idx].lower() in ['st', 'nd', 'rd', 'th']:
             idx += 1
         if idx < len(tokens):
-            month = fuzzy_match(tokens[idx], MONTHS_MAP)
+            month = fuzzy_match(tokens[idx], MONTHS_MAP, cutoff=0.75)
             if month and 1 <= day <= 31:
                 year = None
                 rem_idx = idx + 1
@@ -345,7 +345,7 @@ def parse_date_component(tokens: list[str]) -> tuple[int, int, int | None, list[
                 return day, month, year, tokens[rem_idx:]
 
     # Case 2: 'nov 9', 'november 9th'
-    month = fuzzy_match(tokens[0], MONTHS_MAP)
+    month = fuzzy_match(tokens[0], MONTHS_MAP, cutoff=0.75)
     if month and len(tokens) >= 2:
         m_day = re.match(r'^(\d{1,2})(?:st|nd|rd|th)?$', tokens[1], re.IGNORECASE)
         if m_day:

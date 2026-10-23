@@ -184,6 +184,19 @@ class TestReminderParser(unittest.TestCase):
                     res["trigger_time"].strftime("%Y-%m-%d %H:%M"), expected
                 )
 
+    def test_weekday_with_time_is_not_month_date(self):
+        """'monday 11' means Monday at 11 AM, not 11 May."""
+        now = datetime(2026, 10, 24, 0, 41, tzinfo=IST)
+        text = "Puneet Manon  AGILE RAYS LLP  7483007175  cb monday 11"
+        res = parse_followup_command(text, now)
+        self.assertIsNotNone(res)
+        self.assertEqual(res["trigger_time"].strftime("%Y-%m-%d %H:%M"), "2026-10-26 11:00")
+        self.assertEqual(res["remainder"], "")
+
+        date_res = parse_followup_command("cb may 11", now)
+        self.assertIsNotNone(date_res)
+        self.assertEqual(date_res["trigger_time"].strftime("%Y-%m-%d %H:%M"), "2027-05-11 11:00")
+
     def test_alias_keywords_do_not_fire_mid_sentence(self):
         """'alert'/'timer' only act as triggers at the start of a message."""
         self.assertIsNone(parse_followup_command("security alert tomorrow", self.test_now))

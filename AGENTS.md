@@ -136,5 +136,5 @@ There is no separate lint/typecheck command configured in this repo.
 
 ## Last verified
 
-2026-10-24 — 19 unit tests passing; additive migration preserves old reminders and creates a
-pre-migration backup; `/restore` payload decoding tested.
+2026-10-24 — 20 unit tests passing; additive migration preserves old reminders and creates a
+pre-migration backup; `/restore` payload decoding and weekday-with-time parsing tested.
