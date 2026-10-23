@@ -2,16 +2,21 @@
 Automated unit tests for parser, daytime logic, typo tolerance, and date parsing
 """
 
+import base64
+import json
 import unittest
-from datetime import datetime
+import zlib
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from parser import (
     IST,
+    decode_restore_payload,
+    format_relative_delta,
+    parse_duration,
     parse_followup_command,
     parse_time_component,
     resolve_hour,
-    format_relative_delta,
 )
 
 class TestReminderParser(unittest.TestCase):
@@ -147,6 +152,72 @@ class TestReminderParser(unittest.TestCase):
         res = parse_followup_command("cb tmr same time", self.test_now)
         self.assertIsNotNone(res)
         self.assertEqual(res["trigger_time"].strftime("%Y-%m-%d %H:%M"), "2026-10-18 14:00")
+
+    def test_new_timer_options(self):
+        """Test alternate keywords, day periods, next week, and combined timers."""
+        cases = [
+            ("remind me in 10m", "2026-10-17 14:10"),
+            ("timer 1h30m", "2026-10-17 15:30"),
+            ("alert 2 hours", "2026-10-17 16:00"),
+            ("cb half an hour", "2026-10-17 14:30"),
+            ("cb a couple of hours", "2026-10-17 16:00"),
+            ("cb in 2 days at 5pm", "2026-10-19 17:00"),
+            ("cb 2 days 9am", "2026-10-19 09:00"),
+            ("cb next week", "2026-10-24 14:00"),
+            ("cb in 1 week evening", "2026-10-24 18:00"),
+            ("cb tomorrow evening", "2026-10-18 18:00"),
+            ("cb monday morning", "2026-10-19 10:00"),
+            ("cb tonight", "2026-10-17 20:00"),
+            ("cb eod", "2026-10-17 18:00"),
+            ("cb friday same time", "2026-10-23 14:00"),
+            ("cb 9 nov same time", "2026-11-09 14:00"),
+            ("set a timer for 15m", "2026-10-17 14:15"),
+            ("set an alarm for 30m", "2026-10-17 14:30"),
+            ("set a reminder for 45m", "2026-10-17 14:45"),
+        ]
+
+        for text, expected in cases:
+            with self.subTest(text=text):
+                res = parse_followup_command(text, self.test_now)
+                self.assertIsNotNone(res, text)
+                self.assertEqual(
+                    res["trigger_time"].strftime("%Y-%m-%d %H:%M"), expected
+                )
+
+    def test_alias_keywords_do_not_fire_mid_sentence(self):
+        """'alert'/'timer' only act as triggers at the start of a message."""
+        self.assertIsNone(parse_followup_command("security alert tomorrow", self.test_now))
+        res = parse_followup_command("alert tomorrow", self.test_now)
+        self.assertIsNotNone(res)
+        self.assertEqual(res["trigger_time"].strftime("%Y-%m-%d %H:%M"), "2026-10-18 11:00")
+
+    def test_parse_duration(self):
+        """Test standalone duration parsing used by /snooze."""
+        self.assertEqual(parse_duration("10m"), timedelta(minutes=10))
+        self.assertEqual(parse_duration("1h30m"), timedelta(minutes=90))
+        self.assertEqual(parse_duration("half an hour"), timedelta(minutes=30))
+        self.assertEqual(parse_duration("2 days"), timedelta(days=2))
+        self.assertIsNone(parse_duration("10m call client"))
+
+    def test_decode_restore_payload(self):
+        raw = [
+            {"text": "  call client  ", "trigger_iso": "2026-10-24T11:00:00+05:30"},
+            {"text": "send quote", "trigger_iso": "2026-10-26T16:00:00"},
+        ]
+        payload = base64.urlsafe_b64encode(
+            zlib.compress(json.dumps(raw).encode("utf-8"))
+        ).decode("ascii")
+
+        items = decode_restore_payload(payload)
+        self.assertEqual(len(items), 2)
+        self.assertEqual(items[0]["text"], "call client")
+        self.assertEqual(items[0]["trigger_time"].isoformat(), "2026-10-24T11:00:00+05:30")
+        self.assertEqual(items[1]["trigger_time"].isoformat(), "2026-10-26T16:00:00+05:30")
+
+        with self.assertRaises(ValueError):
+            decode_restore_payload("not-a-payload")
+        with self.assertRaises(ValueError):
+            decode_restore_payload("")
 
     def test_format_relative_delta(self):
         now = self.test_now

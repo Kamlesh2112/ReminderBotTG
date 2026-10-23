@@ -5,16 +5,20 @@ Features:
 - Working Hours Rule: Daytime between 9:00 AM and 8:00 PM IST (single digits 1..8 -> PM, 9..11 -> AM).
 - Typo & Spelling Error Tolerance: Uses fuzzy matching for days, months, and units.
 - Date Support: 'cb 9 nov', 'cb 9th nov', 'cb 9 nov 430', 'cb nov 9', 'cb 25 dec 5', etc.
+- Alternate keywords: remind me, reminder, timer, alert, set a timer for.
+- More options: '1h30m', 'half an hour', 'in 2 days at 5pm', 'next week', day periods.
 - Optional LLM Fallback: Uses Google Gemini if GEMINI_API_KEY is configured.
 """
 
 from __future__ import annotations
 
+import base64
 import difflib
 import json
 import logging
 import os
 import re
+import zlib
 from datetime import datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -51,6 +55,32 @@ MONTHS_MAP: dict[str, int] = {
 
 DEFAULT_DAY_HOUR = 11
 DEFAULT_DAY_MINUTE = 0
+
+DAY_PERIODS: dict[str, tuple[int, int]] = {
+    "morning": (10, 0),
+    "afternoon": (15, 0),
+    "evening": (18, 0),
+    "night": (20, 0),
+    "tonight": (20, 0),
+    "noon": (12, 0),
+    "midnight": (0, 0),
+    "eod": (18, 0),
+    "cob": (18, 0),
+}
+
+TRIGGER_PATTERN = re.compile(
+    r'(?:\b(?:cb|cbb|call\s*back|callback)\b'
+    r'|^(?:set\s+(?:a\s+|an\s+)?(?:timer|reminder|alarm)'
+    r'|remind(?:\s+me)?|reminder|timer|alert|alarm)\b)',
+    re.IGNORECASE,
+)
+
+MAX_REMINDER_DAYS = 3660
+
+
+def has_reminder_trigger(text: str) -> bool:
+    """Returns True if the text contains a recognised reminder keyword."""
+    return TRIGGER_PATTERN.search(text) is not None
 
 
 def get_current_ist_time() -> datetime:
@@ -90,6 +120,46 @@ def match_duration_unit(u: str) -> str | None:
         if difflib.get_close_matches(u, [opt], n=1, cutoff=0.6):
             return target
     return None
+
+
+def match_day_period(token: str) -> tuple[int, int] | None:
+    """Matches day periods like 'morning', 'evening', 'tonight', 'eod' with typo tolerance."""
+    token = token.lower().strip().rstrip('.!,')
+    if token in DAY_PERIODS:
+        return DAY_PERIODS[token]
+    matches = difflib.get_close_matches(token, list(DAY_PERIODS.keys()), n=1, cutoff=0.75)
+    if matches:
+        return DAY_PERIODS[matches[0]]
+    return None
+
+
+def consume_same_time(tokens: list[str]) -> tuple[bool, list[str]]:
+    """Detects and removes 'same time' / 'current time' phrases from tokens."""
+    rem_text = " ".join(tokens).lower()
+    if not re.search(r'\b(?:same\s*time|current\s*time)\b', rem_text):
+        return False, tokens
+    stop = {"same", "time", "at", "current"}
+    return True, [t for t in tokens if t.lower() not in stop]
+
+
+def parse_optional_time(tokens: list[str]) -> tuple[tuple[int, int] | None, list[str]]:
+    """Parses an optional clock time or day period from the start of tokens."""
+    if tokens and tokens[0].lower() == "at":
+        tokens = tokens[1:]
+
+    for k in (2, 1):
+        if len(tokens) >= k:
+            cand = " ".join(tokens[:k])
+            parsed = parse_time_component(cand)
+            if parsed:
+                return parsed, tokens[k:]
+
+    if tokens:
+        period = match_day_period(tokens[0])
+        if period:
+            return period, tokens[1:]
+
+    return None, tokens
 
 
 def resolve_hour(hour: int, minute: int = 0, am_pm: str | None = None) -> tuple[int, int]:
@@ -185,9 +255,30 @@ def parse_relative_duration(s: str) -> tuple[timedelta | None, str]:
         clean = clean[3:].strip()
         s = s[3:].strip()
 
-    pattern = r'^(\d+(?:\.\d+)?)\s*([a-zA-Z]+)\b'
+    pattern = r'^(\d+(?:\.\d+)?)\s*([a-zA-Z]+)'
     total_delta = timedelta()
     matched = False
+
+    word_match = re.match(
+        r'^(half\s+(?:an?\s+)?hour|an?\s+hour|half\s+(?:an?\s+)?minute|an?\s+minute|'
+        r'an?\s+day|an?\s+week|a\s+couple\s+of\s+(minutes|hours|days|weeks))\b',
+        clean,
+    )
+    if word_match:
+        phrase = word_match.group(1)
+        if "couple" in phrase:
+            unit_word = word_match.group(2)
+            factor = 2.0
+        else:
+            unit_word = phrase.split()[-1]
+            factor = 0.5 if phrase.startswith("half") else 1.0
+        unit = match_duration_unit(unit_word)
+        if unit:
+            seconds = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}[unit]
+            total_delta += timedelta(seconds=seconds * factor)
+            matched = True
+            clean = clean[word_match.end():].strip()
+            s = s[word_match.end():].strip()
 
     while True:
         m = re.match(pattern, clean)
@@ -218,6 +309,14 @@ def parse_relative_duration(s: str) -> tuple[timedelta | None, str]:
     if matched:
         return total_delta, s
     return None, s
+
+
+def parse_duration(s: str) -> timedelta | None:
+    """Parses a standalone duration (e.g. for snooze). Returns None if not a pure duration."""
+    delta, remainder = parse_relative_duration(s.strip())
+    if delta is not None and delta.total_seconds() > 0 and not remainder.strip():
+        return delta
+    return None
 
 
 def parse_date_component(tokens: list[str]) -> tuple[int, int, int | None, list[str]] | None:
@@ -337,8 +436,8 @@ def parse_followup_command(raw_text: str, now: datetime | None = None) -> dict[s
 
     text = raw_text.strip()
 
-    # Match 'cb', 'cbb', 'call back', 'callback' with word boundaries
-    match = re.search(r'\b(?:cb|cbb|call\s*back)\b', text, flags=re.IGNORECASE)
+    # Match cb / cbb / call back / callback / remind (me) / reminder / timer / alert
+    match = TRIGGER_PATTERN.search(text)
     if not match:
         llm_res = parse_with_llm(text, now)
         if llm_res:
@@ -354,20 +453,34 @@ def parse_followup_command(raw_text: str, now: datetime | None = None) -> dict[s
     if not after_cb:
         return None
 
-    # Strip optional leading 'on ', 'at ', or 'in '
-    if after_cb.lower().startswith("on "):
-        after_cb = after_cb[3:].strip()
-    elif after_cb.lower().startswith("at "):
-        after_cb = after_cb[3:].strip()
+    # Strip optional leading connector words: on / at / in / for / after
+    for connector in ("on", "at", "in", "for", "after"):
+        if after_cb.lower().startswith(connector + " "):
+            after_cb = after_cb[len(connector) + 1:].strip()
+            break
 
-    # 1. Relative duration check (e.g. '2 days', '10m', '2hr', '2h', '2 dys', '10 minuts')
+    # 1. Relative duration check (e.g. '2 days', '10m', '2hr', 'half an hour')
     delta, remainder = parse_relative_duration(after_cb)
     if delta is not None and delta.total_seconds() > 0:
+        if delta > timedelta(days=MAX_REMINDER_DAYS):
+            return None
+
+        trigger_time = now + delta
+        rem_tokens = remainder.split()
+        time_part, rem_tokens = parse_optional_time(rem_tokens)
+
+        # Allow "in 2 days at 5pm" / "in 1 week evening": apply a clock time
+        # only when the duration lands on a whole-day boundary.
+        if time_part and delta.days >= 1 and delta.seconds == 0:
+            trigger_time = trigger_time.replace(
+                hour=time_part[0], minute=time_part[1], second=0, microsecond=0
+            )
+
         return {
             "original_text": text,
             "prefix": prefix,
-            "remainder": remainder.strip(),
-            "trigger_time": now + delta,
+            "remainder": " ".join(rem_tokens).strip(),
+            "trigger_time": trigger_time,
             "type": "relative"
         }
 
@@ -383,21 +496,13 @@ def parse_followup_command(raw_text: str, now: datetime | None = None) -> dict[s
         day, month, yr, rem_tokens = date_parsed
         year = yr if yr is not None else now.year
 
-        # Check for optional time following the date (e.g. '430', '4:30', '5pm')
-        if rem_tokens and rem_tokens[0].lower() == "at":
-            rem_tokens = rem_tokens[1:]
+        # Optional 'same time', clock time or day period after the date
+        same_time, rem_tokens = consume_same_time(rem_tokens)
+        time_part, rem_tokens = parse_optional_time(rem_tokens)
 
-        time_part = None
-        for k in [2, 1]:
-            if len(rem_tokens) >= k:
-                cand = " ".join(rem_tokens[:k])
-                parsed = parse_time_component(cand)
-                if parsed:
-                    time_part = parsed
-                    rem_tokens = rem_tokens[k:]
-                    break
-
-        if time_part:
+        if same_time:
+            h, m = now.hour, now.minute
+        elif time_part:
             h, m = time_part
         else:
             h, m = DEFAULT_DAY_HOUR, DEFAULT_DAY_MINUTE
@@ -426,6 +531,38 @@ def parse_followup_command(raw_text: str, now: datetime | None = None) -> dict[s
         tokens = tokens[1:]
         first = tokens[0].lower()
 
+    # 'next week' / 'next wk' -> same time seven days later (optional time)
+    if is_next and first in ("week", "wk"):
+        rem_tokens = tokens[1:]
+        time_part, rem_tokens = parse_optional_time(rem_tokens)
+        trigger_time = (now + timedelta(days=7)).replace(second=0, microsecond=0)
+        if time_part:
+            trigger_time = trigger_time.replace(hour=time_part[0], minute=time_part[1])
+        return {
+            "original_text": text,
+            "prefix": prefix,
+            "remainder": " ".join(rem_tokens).strip(),
+            "trigger_time": trigger_time,
+            "type": "next_week"
+        }
+
+    # Standalone day periods: 'tonight', 'eod', 'evening', 'morning', etc.
+    # Checked before fuzzy weekday matching because short words like 'eod'
+    # can otherwise be mistaken for 'wed'/'tod'.
+    period = match_day_period(first)
+    if period and not is_next:
+        h, m = period
+        cand_time = datetime(now.year, now.month, now.day, h, m, 0, tzinfo=IST)
+        if cand_time <= now:
+            cand_time += timedelta(days=1)
+        return {
+            "original_text": text,
+            "prefix": prefix,
+            "remainder": " ".join(tokens[1:]).strip(),
+            "trigger_time": cand_time,
+            "type": "time_only"
+        }
+
     # 3. Weekday check with fuzzy typo tolerance ('monday', 'mondy', 'tuseday', 'wensday', etc.)
     target_weekday = fuzzy_match(first, WEEKDAYS_MAP)
     if target_weekday is not None:
@@ -433,20 +570,12 @@ def parse_followup_command(raw_text: str, now: datetime | None = None) -> dict[s
         days_ahead = (target_weekday - current_weekday) % 7
 
         rem_tokens = tokens[1:]
-        if rem_tokens and rem_tokens[0].lower() == "at":
-            rem_tokens = rem_tokens[1:]
+        same_time, rem_tokens = consume_same_time(rem_tokens)
+        time_part, rem_tokens = parse_optional_time(rem_tokens)
 
-        time_part = None
-        for k in [2, 1]:
-            if len(rem_tokens) >= k:
-                cand = " ".join(rem_tokens[:k])
-                parsed = parse_time_component(cand)
-                if parsed:
-                    time_part = parsed
-                    rem_tokens = rem_tokens[k:]
-                    break
-
-        if time_part:
+        if same_time:
+            h, m = now.hour, now.minute
+        elif time_part:
             h, m = time_part
         else:
             h, m = DEFAULT_DAY_HOUR, DEFAULT_DAY_MINUTE
@@ -474,26 +603,11 @@ def parse_followup_command(raw_text: str, now: datetime | None = None) -> dict[s
     tom_match = difflib.get_close_matches(first, ["tomorrow", "tom", "tmrw", "tmr", "2moro", "tomorow"], n=1, cutoff=0.6)
     if tom_match:
         rem_tokens = tokens[1:]
-        if rem_tokens and rem_tokens[0].lower() == "at":
-            rem_tokens = rem_tokens[1:]
-
-        # Check if user requested "same time"
-        rem_text = " ".join(rem_tokens).lower()
-        wants_same_time = bool(re.search(r'\b(?:same\s*time|current\s*time)\b', rem_text))
+        wants_same_time, rem_tokens = consume_same_time(rem_tokens)
         if wants_same_time:
-            rem_tokens = [t for t in rem_tokens if t.lower() not in ["same", "time", "at", "current"]]
             h, m = now.hour, now.minute
         else:
-            time_part = None
-            for k in [2, 1]:
-                if len(rem_tokens) >= k:
-                    cand = " ".join(rem_tokens[:k])
-                    parsed = parse_time_component(cand)
-                    if parsed:
-                        time_part = parsed
-                        rem_tokens = rem_tokens[k:]
-                        break
-
+            time_part, rem_tokens = parse_optional_time(rem_tokens)
             if time_part:
                 h, m = time_part
             else:
@@ -513,18 +627,7 @@ def parse_followup_command(raw_text: str, now: datetime | None = None) -> dict[s
     today_match = difflib.get_close_matches(first, ["today", "tod", "tday"], n=1, cutoff=0.6)
     if today_match:
         rem_tokens = tokens[1:]
-        if rem_tokens and rem_tokens[0].lower() == "at":
-            rem_tokens = rem_tokens[1:]
-
-        time_part = None
-        for k in [2, 1]:
-            if len(rem_tokens) >= k:
-                cand = " ".join(rem_tokens[:k])
-                parsed = parse_time_component(cand)
-                if parsed:
-                    time_part = parsed
-                    rem_tokens = rem_tokens[k:]
-                    break
+        time_part, rem_tokens = parse_optional_time(rem_tokens)
 
         if time_part:
             h, m = time_part
@@ -542,23 +645,20 @@ def parse_followup_command(raw_text: str, now: datetime | None = None) -> dict[s
             "type": "today"
         }
 
-    # 6. Direct time today / tomorrow (e.g. 'cb 430', 'cb 4:30', 'cb 11', 'cb 5pm')
-    for k in [2, 1]:
-        if len(tokens) >= k:
-            cand = " ".join(tokens[:k])
-            parsed = parse_time_component(cand)
-            if parsed:
-                h, m = parsed
-                cand_time = datetime(now.year, now.month, now.day, h, m, 0, tzinfo=IST)
-                if cand_time <= now:
-                    cand_time += timedelta(days=1)
-                return {
-                    "original_text": text,
-                    "prefix": prefix,
-                    "remainder": " ".join(tokens[k:]).strip(),
-                    "trigger_time": cand_time,
-                    "type": "time_only"
-                }
+    # 6. Direct time today / tomorrow (e.g. 'cb 430', 'cb 5pm', 'cb tonight', 'cb eod')
+    time_part, rem_tokens = parse_optional_time(tokens)
+    if time_part:
+        h, m = time_part
+        cand_time = datetime(now.year, now.month, now.day, h, m, 0, tzinfo=IST)
+        if cand_time <= now:
+            cand_time += timedelta(days=1)
+        return {
+            "original_text": text,
+            "prefix": prefix,
+            "remainder": " ".join(rem_tokens).strip(),
+            "trigger_time": cand_time,
+            "type": "time_only"
+        }
 
     # Fallback to LLM if configured
     llm_res = parse_with_llm(text, now)
@@ -629,4 +729,53 @@ def format_minimal_set_time(trigger_time: datetime, now: datetime | None = None)
         if dt_ist.year != now.year:
             day_str += f" {dt_ist.year}"
         return f"{day_str} at {time_str}"
+
+
+def decode_restore_payload(payload: str, max_items: int = 100) -> list[dict[str, Any]]:
+    """
+    Decodes a compact backup payload for /restore.
+
+    Payload is URL-safe base64 of zlib-compressed JSON:
+    [{"text": "...", "trigger_iso": "2026-10-24T11:00:00+05:30"}, ...]
+    """
+    compact = (payload or "").strip()
+    if not compact:
+        raise ValueError("Empty restore payload.")
+
+    compact += "=" * (-len(compact) % 4)
+    try:
+        compressed = base64.urlsafe_b64decode(compact.encode("ascii"))
+        if len(compressed) > 512 * 1024:
+            raise ValueError("Restore payload is too large.")
+        decoded = zlib.decompress(compressed)
+        if len(decoded) > 512 * 1024:
+            raise ValueError("Restore payload is too large.")
+        raw_items = json.loads(decoded.decode("utf-8"))
+    except (ValueError, TypeError, zlib.error, UnicodeError, json.JSONDecodeError) as e:
+        raise ValueError(f"Invalid restore payload: {e}") from e
+
+    if not isinstance(raw_items, list) or not raw_items:
+        raise ValueError("Restore payload must contain a non-empty list.")
+    if len(raw_items) > max_items:
+        raise ValueError(f"Restore payload contains more than {max_items} reminders.")
+
+    items: list[dict[str, Any]] = []
+    for raw in raw_items:
+        if not isinstance(raw, dict):
+            raise ValueError("Each restore item must be an object.")
+        text = str(raw.get("text", "")).strip()
+        trigger_iso = str(raw.get("trigger_iso", "")).strip()
+        if not text or not trigger_iso:
+            raise ValueError("Each restore item needs text and trigger_iso.")
+        try:
+            trigger_time = datetime.fromisoformat(trigger_iso)
+        except ValueError as e:
+            raise ValueError(f"Invalid trigger_iso: {trigger_iso}") from e
+        if trigger_time.tzinfo is None:
+            trigger_time = trigger_time.replace(tzinfo=IST)
+        items.append({
+            "text": text[:4000],
+            "trigger_time": trigger_time.astimezone(IST)
+        })
+    return items
 
